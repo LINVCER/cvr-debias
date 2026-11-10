@@ -1,0 +1,9 @@
+# 构建上下文只需要源码与配置：数据、产物、报告都不要进镜像
+data/
+artifacts/
+doc/
+tests/
+scripts/
+*.md
+.git/
+__pycache__/

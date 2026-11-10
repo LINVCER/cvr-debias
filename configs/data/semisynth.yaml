@@ -1,0 +1,8 @@
+# 半合成偏差基准（C5）：转化标签全部已知，点击按可控策略选择性暴露。
+# 输入 L2 成品层，输出独立的新层 40_semisynth，绝不改写 L2
+gammas: [0, 0.5, 1, 2, 4]   # 偏差强度 β
+teacher_ckpt: artifacts/models/teacher_cvr.pt
+target_ctr: 0.04
+in_dir: data/aliccp/20_processed
+out_dir: data/aliccp/40_semisynth
+seed: 0

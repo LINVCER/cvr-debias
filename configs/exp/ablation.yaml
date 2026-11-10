@@ -1,0 +1,11 @@
+# 消融：不改代码，只改参数
+# 去 C1：calibration.enabled=false 且 loss.alpha=0，T=1
+# 只留截断不做校准：loss.alpha 保持、calibration.temperature_fixed=1
+# 去 C2：loss.name=dr 且 loss.gamma=1（插补换回普通 MSE）
+# 去 C3：model.n_propensity=0 model.n_conversion=0 model.n_shared=8
+# 全去：等价 ESCM²-DR，用于实现正确性自检（必须与独立实现数值一致）
+name: ablation
+overrides:
+  train.epochs: 10
+  train.batch_size: 4096
+  train.device: cuda

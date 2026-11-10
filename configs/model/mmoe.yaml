@@ -1,0 +1,5 @@
+# MMoE：专家分解 + 门控缓解任务冲突，但不触及 SSB（结构对照）
+emb_dim: 16
+expert_dim: 32
+n_experts: 8
+hidden: [32]

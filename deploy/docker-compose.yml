@@ -1,0 +1,17 @@
+# 演示环境：单容器起服务，模型产物用只读卷挂进来（不烤进镜像）
+# 启动：docker compose -f deploy/docker-compose.yml up -d --build
+# 切换模型：RUN_DIR=artifacts/runs/main/esmm/seed0 docker compose -f deploy/docker-compose.yml up -d
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: cvr-debias-api:0.1
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../artifacts:/app/artifacts:ro
+    environment:
+      # 默认指向冒烟产物，开箱即可跑；真实实验训完后改成 artifacts/runs/main/<model>/seed0
+      RUN_DIR: ${RUN_DIR:-artifacts/runs/smoke/uc_escm/seed0}
+    restart: unless-stopped

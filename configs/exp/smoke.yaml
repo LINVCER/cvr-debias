@@ -1,0 +1,6 @@
+# 第一阶段：冒烟测试，5 分钟内必须跑通，不通不往下走
+name: smoke
+overrides:
+  train.epochs: 8
+  train.batch_size: 1024
+  data.n_samples: 20000

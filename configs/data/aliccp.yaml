@@ -1,0 +1,31 @@
+# Ali-CCP 主数据集（真实实验用）
+# 分层约定见 data/aliccp/README.md；路径相对于项目根，换机器不用改
+# 逐字节事实见 doc/202610-选题/08-数据探测记录.md
+data_root: data/aliccp
+dirs:
+  raw: data/aliccp/00_raw            # L0 只读
+  interim: data/aliccp/10_interim    # L1 可重建
+  processed: data/aliccp/20_processed  # L2 训练唯一输入
+  sample: data/aliccp/30_sample      # L3 调参采样
+  semisynth: data/aliccp/40_semisynth  # L3 半合成基准（C5）
+  reports: data/aliccp/90_reports    # L4 论文数字来源
+train_shards: data/aliccp/20_processed/train
+val_shards: data/aliccp/20_processed/val
+test_shards: data/aliccp/20_processed/test
+vocab: data/aliccp/20_processed/vocab.json
+label_cols: [click, conversion]
+# 原始文件分隔符（实测）
+#   特征之间 0x01、field_id 与 value 之间 0x02、value 与 weight 之间 0x03
+seps:
+  feature: "\x01"
+  field: "\x02"
+  weight: "\x03"
+# 质检基线：来自清洗后的全量真值（90_reports/02_cleaning/cleaning_report_20261108-203156.json）
+# 与原始探测值（expected_raw）的差额 = C2 剔除的 conversion=1 且 click=0 行
+expected:
+  train: {exposure: 42299905, click: 1644256, conversion: 8802}
+  test: {exposure: 43016614, click: 1673447, conversion: 9195}
+# 清洗前原始值，来自 90_reports/01_probe/label_stats.json，仅作追溯，不参与断言
+expected_raw:
+  train: {exposure: 42300135, click: 1644256, conversion: 9032}
+  test: {exposure: 43016840, click: 1673447, conversion: 9421}

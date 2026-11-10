@@ -1,0 +1,6 @@
+# 朴素 BCE：点击空间 CVR 损失，用作下界
+name: bce
+# 无因果加权、无截断
+alpha: 0
+gamma: 1.0
+orth_lambda: 0

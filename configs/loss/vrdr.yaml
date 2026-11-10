@@ -1,0 +1,11 @@
+# 方差正则双重稳健（C2）：MRDR 加权平方误差，与校准倾向（C1）联合
+name: vrdr
+alpha: 0.005
+gamma: 1.0
+# 正交正则属于 C3，本科只在展望章讨论，主实验默认关闭。
+# 实测 λ=0.1 时 CTR 头的均值学不出来（AUC 0.16、T 贴到上界）；λ=0.01 仍会压制均值，
+# 故主实验取 0，消融时用 `loss.orth_lambda=0.01` 单跑一组。
+orth_lambda: 0.0
+# 消融自由项：dr 部分的 imp 是否 detach。
+# 默认 true——false 时 imp 会通过线性项无界漂移（12 号 E30 曾漂到 −1e12，CVR 塔坍缩）
+detach_imp: true

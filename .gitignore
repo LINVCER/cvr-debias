@@ -1,0 +1,35 @@
+# 数据与模型产物不入库：只保留分层说明与原始数据清单
+data/**
+!data/aliccp/
+!data/aliccp/README.md
+!data/aliccp/00_raw/
+!data/aliccp/00_raw/manifest.json
+artifacts/
+mlruns/
+*.parquet
+*.onnx
+*.pt
+*.pth
+
+# 环境
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.ipynb_checkpoints/
+
+# 运行产物
+*.log
+derby.log
+metastore_db/
+spark-warehouse/
+*.crc
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

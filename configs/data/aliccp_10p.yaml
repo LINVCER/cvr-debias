@@ -1,0 +1,7 @@
+# 10% 采样集：按用户 ID 哈希采样（不是行级随机），用于调参与开发自测
+# 只从 L2 成品层抽样，产物落 L3；论文数字一律来自全量 L2
+base: aliccp
+sample_ratio: 0.1
+sample_key: user_id
+dirs:
+  sample: data/aliccp/30_sample

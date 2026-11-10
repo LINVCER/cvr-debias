@@ -1,0 +1,7 @@
+# 主实验：全量数据，12 模型 × 5 种子（本科口径取 6 模型）
+name: main
+overrides:
+  train.epochs: 10
+  train.batch_size: 4096
+  train.num_workers: 4
+  train.device: cuda

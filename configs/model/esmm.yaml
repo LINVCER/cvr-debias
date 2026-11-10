@@ -1,0 +1,3 @@
+# ESMM：共享 embedding，在全空间监督 CTR 与 CTCVR，pCVR 隐式学得
+emb_dim: 16
+hidden: [64, 32]

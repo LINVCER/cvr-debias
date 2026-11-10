@@ -1,0 +1,9 @@
+# UC-ESCM：4 层、3 塔、4 项损失
+# 消融即改参数：去 C3 => n_propensity=0 且 n_conversion=0 且 n_shared=8
+emb_dim: 16
+expert_dim: 32
+n_propensity: 2
+n_conversion: 2
+n_shared: 4
+hidden: [64, 32]
+dropout: 0.0

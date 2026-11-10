@@ -1,0 +1,5 @@
+# ESCM²-IPS：逆倾向加权，无插补塔（δ̂ ≡ 0）
+name: ips
+alpha: 0.01
+gamma: 0
+orth_lambda: 0

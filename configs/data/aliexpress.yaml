@@ -1,0 +1,6 @@
+# AliExpress 五国（NL / ES / FR / US / RU）：跳数据集泛化验证，本科口径为可选加分。
+countries: [NL, ES, FR, US, RU]
+raw_dir: /data/aliexpress
+# 数值特征需分桶或标准化，与 Ali-CCP 的纯稀疏管道不同，特征层必须从一开始可配置
+numeric_binning: true
+n_bins: 32

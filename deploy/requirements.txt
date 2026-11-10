@@ -1,0 +1,7 @@
+# 推理镜像只装服务需要的东西：不要带 pandas / pyarrow / pytest，镜像能小一半以上
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.0
+numpy>=1.24
+pyyaml>=6.0
+fastapi>=0.110
+uvicorn[standard]>=0.29

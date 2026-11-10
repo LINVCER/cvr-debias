@@ -1,0 +1,5 @@
+# ESCM²-DR：双重稳健，插补塔普通 MSE，权重手工固定
+name: dr
+alpha: 0.01
+gamma: 1.0
+orth_lambda: 0

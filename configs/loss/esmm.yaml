@@ -1,0 +1,5 @@
+# ESMM 双项全空间监督：CTR + CTCVR，pCVR 只作为中间量
+name: esmm
+alpha: 0
+gamma: 1.0
+orth_lambda: 0

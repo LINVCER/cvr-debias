@@ -1,0 +1,24 @@
+# 主配置。一条实验 = 一行命令，差异全部落在配置里。
+# 运行：python -m src.train exp=smoke data=synthetic model=uc_escm loss=vrdr train.seed=0
+data: synthetic
+model: uc_escm
+loss: vrdr
+exp: smoke
+
+train:
+  epochs: 3
+  batch_size: 1024
+  lr: 0.001
+  seed: 0
+  device: cpu
+  num_workers: 0
+  val_ratio: 0.05
+  run_dir: artifacts/runs
+  ckpt_dir: artifacts/models
+
+calibration:
+  enabled: true
+  # α 只在验证集上选，准则不是 AUC，而是校准误差与权重方差的加权和
+  alphas: [0.001, 0.005, 0.01, 0.05]
+  refit_every: 1
+  var_weight: 0.5

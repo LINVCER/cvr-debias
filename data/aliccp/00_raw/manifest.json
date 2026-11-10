@@ -1,0 +1,57 @@
+{
+  "dataset": "Ali-CCP (sample)",
+  "page": "https://tianchi.aliyun.com/dataset/408",
+  "layout": "数据域分层见 data/aliccp/README.md：00_raw / 10_interim / 20_processed / 30_sample / 90_reports / 99_archive",
+  "packages": [
+    {
+      "file": "sample_train.tar.gz",
+      "bytes": 4405491733,
+      "md5": "48247ef689634736c16ef24469ce4ab1",
+      "verified": true
+    },
+    {
+      "file": "sample_test.tar.gz",
+      "bytes": 5029299086,
+      "md5": "b740599024d2e010ff8f9b7f552fdec4",
+      "verified": true
+    }
+  ],
+  "files": [
+    {
+      "file": "train/sample_skeleton_train.csv",
+      "layer": "00_raw",
+      "split": "train",
+      "role": "skeleton",
+      "bytes": 10891589135,
+      "lines": 42300135,
+      "md5": "50fab4613c9ef14db82406f3a36e03a5"
+    },
+    {
+      "file": "train/common_features_train.csv",
+      "layer": "00_raw",
+      "split": "train",
+      "role": "common_features",
+      "bytes": 8590621765,
+      "lines": 730600,
+      "md5": "4c21a5e4475e55b3dbe45f24271e3fc9"
+    },
+    {
+      "file": "test/sample_skeleton_test.csv",
+      "layer": "00_raw",
+      "split": "test",
+      "role": "skeleton",
+      "bytes": 11018450696,
+      "lines": 43016840,
+      "md5": "726a038da64f376393a9309e5ecfd0f2"
+    },
+    {
+      "file": "test/common_features_test.csv",
+      "layer": "00_raw",
+      "split": "test",
+      "role": "common_features",
+      "bytes": 10997078207,
+      "lines": 884212,
+      "md5": "fc0ee817f17082ca5c444f10061c1bc9"
+    }
+  ]
+}
