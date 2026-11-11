@@ -10,11 +10,13 @@ train:
   batch_size: 1024
   lr: 0.001
   seed: 0
-  device: cpu
+  device: cuda
   num_workers: 0
   val_ratio: 0.05
   run_dir: artifacts/runs
   ckpt_dir: artifacts/models
+  # 消融：把指定域的 id 全置 0（PAD），例如 train.drop_fields=[101]
+  drop_fields: []
 
 calibration:
   enabled: true

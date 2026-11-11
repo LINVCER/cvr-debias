@@ -1,0 +1,8 @@
+# 批次 1 冒烟的「欠训练 vs 特征」对照：同数据同模型，只把 epoch 从 8 拉到 30
+# 输出落 artifacts/runs/smoke_batch1_long/，不覆盖 smoke_batch1/esmm_esmm/seed0
+# 用途：赤手对照，只区分欠训练与特征问题，不作为通过判据
+name: smoke_batch1_long
+overrides:
+  train.epochs: 30
+  train.batch_size: 1024
+  data.n_samples: 20000

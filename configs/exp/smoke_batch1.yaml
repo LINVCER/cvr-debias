@@ -1,0 +1,8 @@
+# 批次 1 冒烟：验证重建后的 10% 数据（新词表 23 域 / K=32 编码）能跑通，判据 CTR AUC >= 0.58
+# 与 smoke.yaml 唯一差异：name 改为 smoke_batch1，输出落 artifacts/runs/smoke_batch1/，不覆盖 11-10 旧冒烟
+# 注：overrides 保持原样；data.n_samples 只对 synthetic 生效，对 aliccp_10p 无影响
+name: smoke_batch1
+overrides:
+  train.epochs: 8
+  train.batch_size: 1024
+  data.n_samples: 20000
