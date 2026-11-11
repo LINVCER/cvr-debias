@@ -11,7 +11,7 @@
    重复约 58 倍；join 与编码一起放在 ADS；
 3. DWS 用 Spark 原生算子从 DWD 独立重算词表，与 20_processed/vocab.json 逐项对账；
    ADS 编码以 vocab.json 的 idx 为准，保证与 pyarrow 产物逐位一致；
-4. ADS 用 22 域 × K=8 int32、C2 清洗、md5 哈希 user_id，Parquet，按 split 分区；
+4. ADS 用 23 域 × K=8 int32、C2 清洗、md5 哈希 user_id，Parquet，按 split 分区；
 5. 全程不用 Python UDF，解析用 split/filter/transform 等高阶函数。
 
 用法（在项目根 E:\\BISHE 下）：
@@ -56,9 +56,9 @@ SEP_FEATURE = "\x01"
 SEP_FIELD = "\x02"
 SEP_WEIGHT = "\x03"
 
-# 22 个建模域：12 个公共域 + 10 个骨架域；101 全量 OOV 已剔除（见 12 号记录 E7）
+# 23 个建模域：13 个公共域 + 10 个骨架域；101 = 用户 ID（12-E33b）
 SKELETON_FIELDS = ["205", "206", "207", "210", "216", "301", "508", "509", "702", "853"]
-COMMON_FIELDS = ["109_14", "110_14", "121", "122", "124", "125", "126",
+COMMON_FIELDS = ["101", "109_14", "110_14", "121", "122", "124", "125", "126",
                  "127", "127_14", "128", "129", "150_14"]
 SPARSE_FIELDS = COMMON_FIELDS + SKELETON_FIELDS
 
@@ -134,17 +134,17 @@ def values_of(pairs, fid: str):
     )
 
 
-def with_user_hash(df):
+def with_user_hash(df, src_col: str = "user_id", out_col: str = "_uhash"):
     """等价于 prepare_aliccp._hash_user：md5 前 8 字节小端，保留 63 位。
 
     md5 只算一次并落成 _md5 列；按字节逆序拼 hex → decimal → 取模 2^63。
     """
-    df = df.withColumn("_md5", F.substring(F.md5(F.col("user_id")), 1, 16))
+    df = df.withColumn("_md5", F.substring(F.md5(F.col(src_col)), 1, 16))
     # 字节序 b0..b7 → 逆序 b7..b0，得到 int.from_bytes(b0..b7, "little") 的大端 hex
     parts = [F.substring(F.col("_md5"), k, 2) for k in (15, 13, 11, 9, 7, 5, 3, 1)]
     dec = F.conv(F.concat(*parts), 16, 10).cast("decimal(38,0)")
     h = F.pmod(dec, F.lit("9223372036854775808").cast("decimal(38,0)")).cast("long")
-    return df.withColumn("_uhash", h).drop("_md5")
+    return df.withColumn(out_col, h).drop("_md5")
 
 
 def _py_hash(uid: str) -> int:
@@ -340,17 +340,28 @@ def stage_dws(spark: SparkSession, limit: int = 0) -> dict:
     if limit:
         exp_df = exp_df.limit(limit)
 
-    def explode_fields(df, fields):
-        parts = [
-            df.select(F.lit(fid).alias("field_id"), F.explode(F.col(f"f_{fid}")).alias("v"))
-            for fid in fields
-        ]
+    # 公共域必须按曝光加权：user_feature 每组一行，而一组特征会被该页所有曝光复用
+    # （train 平均 57.9 条/组）。按行直接计数会把 101（用户 ID，每组 1 次）全量误判为
+    # 低频 → OOV（12-E33b）。这里先按组聚合曝光数，再在 explode 后按权重求和。
+    exp_per_group = exp_df.groupBy("user_id").count().withColumnRenamed("count", "exposure")
+    usr_w = usr_df.join(exp_per_group, "user_id", "inner")
+
+    def explode_fields(df, fields, weight_col=None):
+        parts = []
+        for fid in fields:
+            part = df.select(F.lit(fid).alias("field_id"),
+                             F.explode(F.col(f"f_{fid}")).alias("v"))
+            if weight_col:
+                part = part.withColumn("w", F.col(weight_col))
+            parts.append(part)
         return reduce(lambda a, b: a.unionByName(b), parts)
 
-    items = explode_fields(exp_df, SKELETON_FIELDS).unionByName(
-        explode_fields(usr_df, COMMON_FIELDS)
-    ).where(F.col("v").isNotNull())
-    counts = items.groupBy("field_id", "v").count().where(F.col("count") >= MIN_COUNT)
+    skel_items = explode_fields(exp_df, SKELETON_FIELDS).withColumn("w", F.lit(1))
+    usr_items = explode_fields(usr_w, COMMON_FIELDS, weight_col="exposure")
+    items = skel_items.unionByName(usr_items).where(F.col("v").isNotNull())
+    counts = (items.groupBy("field_id", "v")
+              .agg(F.sum("w").cast("long").alias("count"))
+              .where(F.col("count") >= MIN_COUNT))
     w = Window.partitionBy("field_id").orderBy(F.desc("count"), F.asc("v"))
     vocab = (counts.withColumn("idx", (F.row_number().over(w) + 1).cast("int"))
              .select("field_id", F.col("v").alias("feat_val"), "count", "idx"))
@@ -449,14 +460,17 @@ def stage_ads(spark: SparkSession, limit: int = 0, files_per_split: int = 16) ->
     t0 = time.time()
     vocab = _load_vocab_py()
 
-    # 1) 用户侧预编码（12 域）：用户特征只依赖 user_id，按用户编码一次与逐行编码等价
+    # 1) 用户侧预编码（13 域）：用户特征只依赖 user_id，按用户编码一次与逐行编码等价
     user = spark.table(f"{DB}.dwd_aliccp_user_feature")
+    # 真实用户 ID（域 101 首个取值）先哈希，供 GAUC 分组；必须编码前取，编码后只剩 id
+    user = user.withColumn("_uid_raw", F.element_at(F.col("f_101"), 1))
+    user = with_user_hash(user, "_uid_raw", "_uidhash")
     user_enc = _encode_fields(user, COMMON_FIELDS, vocab).select(
-        "user_id", "split", *[f"f_{fid}" for fid in COMMON_FIELDS]
+        "user_id", "split", "_uidhash", *[f"f_{fid}" for fid in COMMON_FIELDS]
     )
-    user_path = STAGING / "ads_user_encoded"
+    user_path = STAGING / "ads_user_encoded_23dom"
     if (user_path / "_SUCCESS").exists():
-        print("[ads] 复用已编码的用户向量（_staging/ads_user_encoded）")
+        print("[ads] 复用已编码的用户向量（_staging/ads_user_encoded_23dom）")
     else:
         user_enc.write.mode("overwrite").format("parquet").save(user_path.as_uri())
 
@@ -485,6 +499,7 @@ def stage_ads(spark: SparkSession, limit: int = 0, files_per_split: int = 16) ->
     out = joined.select(
         *[f"f_{fid}" for fid in SPARSE_FIELDS],
         "click", "conversion", F.col("_uhash").alias("user_id"), "row_no",
+        F.col("_uidhash").alias("uid"),
         F.col("part").alias("split"),
     ).coalesce(files_per_split)
     save_table(spark, out, "ads_aliccp_train", "parquet", "split")
