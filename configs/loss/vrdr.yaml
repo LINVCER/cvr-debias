@@ -1,4 +1,4 @@
-# 方差正则双重稳健（C2）：MRDR 加权平方误差，与校准倾向（C1）联合
+# 方差正则双重稳健（C2）：MRDR 加权平方误差（Farajtabar et al., ICML 2018），与校准倾向（C1）联合
 name: vrdr
 alpha: 0.005
 gamma: 1.0

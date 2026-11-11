@@ -27,6 +27,7 @@ from src.calibration.temperature import fit_temperature, select_alpha, select_ta
 from src.data import dataset, synthetic
 from src.evaluation.metrics import bias_and_mse, binary_metrics
 from src.losses.causal import (
+    SelfNormalizer,
     bce_logits,
     ctcvr_loss,
     dr_loss,
@@ -174,7 +175,7 @@ def task_names_for(loss_name: str) -> list:
     raise ValueError(f"未知损失 {loss_name}")
 
 
-def compute_loss(out, batch, loss_cfg, calib, weighting):
+def compute_loss(out, batch, loss_cfg, calib, weighting, normalizer=None):
     click, conv = batch["click"], batch["conv"]
     name = loss_cfg["name"]
     losses = {}
@@ -200,6 +201,8 @@ def compute_loss(out, batch, loss_cfg, calib, weighting):
             losses["cvr"] = dr_loss(
                 out["cvr_logit"], out["imp"], click, conv, e,
                 detach_imp=bool(loss_cfg.get("detach_imp", True)),
+                self_normalized=bool(loss_cfg.get("self_normalized", False)),
+                normalizer=normalizer,
             )
             losses["imp"] = imp_mse_loss(out["imp"], out["cvr_logit"], conv, click)
         elif name == "vrdr":
@@ -213,6 +216,8 @@ def compute_loss(out, batch, loss_cfg, calib, weighting):
                 e,
                 gamma=float(loss_cfg.get("gamma", 1.0)),
                 detach_imp=bool(loss_cfg.get("detach_imp", True)),
+                self_normalized=bool(loss_cfg.get("self_normalized", False)),
+                normalizer=normalizer,
             )
         else:
             raise ValueError(f"未知损失 {name}")
@@ -230,13 +235,15 @@ def compute_loss(out, batch, loss_cfg, calib, weighting):
 
 
 @torch.no_grad()
-def predict(model, split, batch_size: int, device, max_rows: int = 0, num_workers: int = 0) -> dict:
+def predict(model, split, batch_size: int, device, max_rows: int = 0, num_workers: int = 0,
+            drop_cols=()) -> dict:
     """max_rows>0 时只评估前若干行，用于真实数据的小步冒烟。"""
     model.eval()
     chunks = {"ctr": [], "cvr": [], "imp": []}
     labels = {"click": [], "conv": [], "user_ids": []}
     seen = 0
     for batch in iter_split(split, batch_size, shuffle=False, num_workers=num_workers):
+        _zero_columns(batch, drop_cols)
         out = model(batch["ids"].to(device, non_blocking=True))
         for src, dst in (("ctr_logit", "ctr"), ("cvr_logit", "cvr"), ("imp", "imp")):
             if out.get(src) is not None:
@@ -315,6 +322,39 @@ def evaluate(pred: dict, calib: dict, n_bins: int = 10) -> dict:
 # ----------------------------------------------------------------------------- 主流程
 
 
+def resolve_field_names(cfg: dict) -> list:
+    """vocab.json 里的域顺序（与 ids 张量的第 1 维严格对应），用于 drop_fields 定位列。"""
+    vocab_path = cfg["data"].get("vocab")
+    if not vocab_path:
+        return []
+    meta = json.loads((ROOT / vocab_path).read_text(encoding="utf-8"))
+    return list(meta.get("fields", []))
+
+
+def resolve_drop_cols(cfg: dict) -> list:
+    """把 `train.drop_fields`（field_id 列表）翻译成 ids 张量的列下标。
+
+    消融用：把某域的 id 全置 0（PAD），等价于「该域整列缺失」，
+    不改 field_dims 与 embedding 表结构，因此不会影响其它域的参数形状。
+    """
+    names = resolve_field_names(cfg)
+    drop = [str(x) for x in (cfg["train"].get("drop_fields") or [])]
+    if not drop:
+        return []
+    if not names:
+        raise ValueError("train.drop_fields 需要 vocab.json 提供 fields，但当前数据配置没有 vocab")
+    unknown = [f for f in drop if f not in names]
+    if unknown:
+        raise ValueError(f"drop_fields 含未知域 {unknown}，可用域：{names}")
+    return [names.index(f) for f in drop]
+
+
+def _zero_columns(batch: dict, cols) -> None:
+    if not cols:
+        return
+    batch["ids"][:, list(cols), :] = 0
+
+
 def run(cfg: dict) -> dict:
     train_cfg = cfg["train"]
     seed = int(train_cfg["seed"])
@@ -335,9 +375,15 @@ def run(cfg: dict) -> dict:
 
     data = load_data(cfg)
     field_dims = resolve_field_dims(cfg)
+    drop_cols = resolve_drop_cols(cfg)
+    if drop_cols:
+        print(f"[ablation] drop_fields={cfg['train']['drop_fields']} → 列下标 {drop_cols}",
+              flush=True)
     model = build_model(cfg["model_name"], cfg["model"], field_dims).to(device)
 
     loss_cfg = cfg["loss"]
+    # SNIPS 的归一化因子必须在整个训练过程中共享，逐 batch 重估会让 Z 抖到跨数量级
+    normalizer = SelfNormalizer() if loss_cfg.get("self_normalized") else None
     weighting = build_weighting(
         loss_cfg.get("weighting", "uncertainty"), task_names_for(loss_cfg["name"])
     ).to(device)
@@ -378,8 +424,9 @@ def run(cfg: dict) -> dict:
         for batch in iter_split(data["train"], batch_size, shuffle=True, generator=generator,
                                 num_workers=num_workers, epoch=epoch):
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+            _zero_columns(batch, drop_cols)
             out = model(batch["ids"])
-            total, detail = compute_loss(out, batch, loss_cfg, calib, weighting)
+            total, detail = compute_loss(out, batch, loss_cfg, calib, weighting, normalizer)
             opt.zero_grad()
             total.backward()
             # 兜底：imp/1e 加权项曾有数值漂移，裁剪防止单步爆炸
@@ -398,7 +445,7 @@ def run(cfg: dict) -> dict:
         cal_sec = 0.0
         if cal_cfg.get("enabled", True):
             t_cal = time.time()
-            val_pred = predict(model, data["val"], batch_size, device, max_rows=eval_max_rows, num_workers=num_workers)
+            val_pred = predict(model, data["val"], batch_size, device, max_rows=eval_max_rows, num_workers=num_workers, drop_cols=drop_cols)
             if val_pred["ctr"] is not None:
                 temperature = fit_temperature(val_pred["ctr"], val_pred["click"])
                 chosen = select_alpha(val_pred["ctr"], val_pred["click"], alphas, temperature, var_weight)
@@ -413,6 +460,8 @@ def run(cfg: dict) -> dict:
                   f"T={calib['temperature']:.3f} tau={calib['tau']:.4f}", flush=True)
             # 数值健康巡检：CVR 头坍缩与 imp 越界都不会报错，只能主动盯
             health = _check_numeric_health(val_pred)
+            if normalizer is not None:
+                health["snips_z"] = normalizer.value
             _write_state({
                 "epoch": epoch + 1,
                 "epochs": int(train_cfg["epochs"]),
@@ -431,7 +480,7 @@ def run(cfg: dict) -> dict:
             break
 
     t_eval = time.time()
-    test_pred = predict(model, data["test"], batch_size, device, max_rows=eval_max_rows, num_workers=num_workers)
+    test_pred = predict(model, data["test"], batch_size, device, max_rows=eval_max_rows, num_workers=num_workers, drop_cols=drop_cols)
     t_metrics = time.time()
     metrics = evaluate(test_pred, calib)
     print(f"[eval] test 推理 {t_metrics - t_eval:.1f}s，指标计算 {time.time() - t_metrics:.1f}s", flush=True)

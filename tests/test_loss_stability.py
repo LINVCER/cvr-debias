@@ -15,7 +15,7 @@
 import torch
 
 import src.models  # noqa: F401  触发模型注册
-from src.losses.causal import dr_loss, vr_dr_loss
+from src.losses.causal import SelfNormalizer, dr_loss, vr_dr_loss
 from src.models.base import build_model
 from src.models.uc_escm import IMP_MAX
 
@@ -97,3 +97,33 @@ def test_vrdr_300_steps_keeps_imp_bounded_and_cvr_alive():
     assert float(imp_out.max()) <= IMP_MAX + 1e-6, f"imp 越界: {float(imp_out.max())}"
     assert float(cvr_logit.std()) > 1e-3, "CVR 输出坍缩为常数"
     assert cvr_logit.unique().numel() > 100, "CVR 输出几乎无区分度"
+
+
+def test_self_normalizer_smooths_heavy_batches():
+    """SNIPS 的 Z 必须跨 batch 平滑：单批重尾（一个 e=1e-4 的点击）不得让 w 爆炸。"""
+    normalizer = SelfNormalizer(decay=0.99)
+    e = torch.full((1000,), 0.05)
+    click = torch.zeros(1000)
+    click[:50] = 1                      # 5% CTR → Z = 1.0
+    normalizer.normalize(click / e)
+    assert abs(normalizer.value - 1.0) < 1e-6
+
+    heavy = torch.zeros(1000)
+    heavy[0] = 1e4                      # 相当于 e=1e-4 的单个点击
+    w = normalizer.normalize(heavy)
+    assert normalizer.value < 5.0, "EMA 未压住重尾批"
+    assert float(w.max()) < 1e4, "单批 Z 直接重估会让 w 跨数量级"
+
+
+def test_self_normalizer_z_has_no_gradient():
+    """Z 必须 detach：否则归一化项会引入与主项反号的梯度（SNIPS 塌陷的候选成因）。"""
+    e = torch.full((10,), 0.5)
+    click = torch.zeros(10)
+    click[:2] = 1
+    w = (click / e).requires_grad_(True)
+    normalizer = SelfNormalizer()
+    out = normalizer.normalize(w)
+    out.sum().backward()
+    # Z 作为常数处理时，每个元素的梯度应恰为 1/Z；若 Z 参与反传会多出反号项
+    expected = 1.0 / normalizer.value
+    assert torch.allclose(w.grad, torch.full_like(w, expected))

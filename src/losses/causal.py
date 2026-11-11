@@ -8,14 +8,40 @@
 - L_IPS   = Σ o·δ/e；
 - L_DR    = Σ [δ̂ + o(δ - δ̂)/e]，e 或 δ̂ 任一正确即无偏。
 
-方差正则项来自 MRDR（SIGIR 2021），不是本研究原创：本研究把它从点击空间推广到
-全空间 ESCM² 框架，并与校准倾向联合分析。开题与论文必须按这个口径表述。
+方差正则项来自 MRDR（Farajtabar et al., ICML 2018），不是本研究原创：本研究把它从
+off-policy evaluation 场景迁移到 CVR 全空间，并与校准倾向联合分析。开题与论文必须按这个
+口径表述——原论文是强化学习的策略评估，不是 CVR，迁移本身需要在论文里说明。
 """
+
+import math
 
 import torch
 import torch.nn.functional as F
 
 EPS = 1e-6
+
+
+class SelfNormalizer:
+    """SNIPS 自归一化因子的跨 batch EMA。
+
+    Z = E[click/e] 理论上等于 1，但单批只有约 650 个点击，且 1/e 在 τ 截断后重尾
+    （单个 e=1e-4 的点击可贡献 Z 的 0.6），逐 batch 重估会让有效学习率跨数量级抖动。
+    这里用 EMA 平滑；e 已在 `propensity_score` 里 detach，Z 天然不参与反传。
+    """
+
+    def __init__(self, decay: float = 0.99):
+        self.decay = float(decay)
+        self.value: float | None = None
+
+    def normalize(self, w_raw: torch.Tensor) -> torch.Tensor:
+        z_batch = float(w_raw.mean().detach())
+        if not math.isfinite(z_batch) or z_batch <= 0:
+            z_batch = 1.0
+        if self.value is None:
+            self.value = z_batch
+        else:
+            self.value = self.decay * self.value + (1.0 - self.decay) * z_batch
+        return w_raw / max(self.value, EPS)
 
 
 def bce_logits(logit: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
@@ -80,15 +106,25 @@ def dr_loss(
     conv: torch.Tensor,
     e: torch.Tensor,
     detach_imp: bool = True,
+    self_normalized: bool = False,
+    normalizer: "SelfNormalizer | None" = None,
 ) -> torch.Tensor:
     """双重稳健风险：全空间插补 + 点击空间残差纠偏。
 
-    :param detach_imp: 插补项是否 detach，默认 True。
-        若为 False，`mean(imp)` 这一项会让 imp 无界漂移——它的梯度是 1 - click/e，
-        期望近似 0 但不严格为 0，训练上万步后会累积到 −1e12 量级（见 12 号 E30）。
-        imp 塔的学习应完全交给 imp_mse_loss，DR 项只把它当常数基线用。
+    :param detach_imp: 插补项是否 detach。True 时 `mean(imp)` 对 imp 无梯度，
+        但也切断了 imp 塔经共享 embedding 回流到 CVR 塔的间接通道（E33 附注）。
+    :param self_normalized: SNIPS 自归一化权重（Swaminathan & Joachims, NeurIPS 2015）。
+        用 w = (click/e) / E[click/e] 替换 click/e。因为 Σw = N，
+        `∂dr/∂imp_i = (1 - w_i)/N` 在整个 batch 上求和恒为 0，漂移项在 batch 内
+        精确抵消，因此可以安全地不 detach（E30 的 −1e12 漂移根因）。
+    :param normalizer: 跨 batch 的 Z 估计器；不给则退回逐 batch（仅用于单测）。
     """
     delta = F.binary_cross_entropy_with_logits(cvr_logit, conv.float(), reduction="none")
+    if self_normalized:
+        w = click / e
+        w = normalizer.normalize(w) if normalizer is not None else w / w.mean().clamp_min(EPS)
+        imp_term = imp.detach() if detach_imp else imp
+        return (imp_term + w * (delta - imp_term)).mean()
     imp_for_dr = imp.detach() if detach_imp else imp
     return (imp_for_dr + click * (delta - imp_for_dr) / e).mean()
 
@@ -107,20 +143,30 @@ def vr_dr_loss(
     e: torch.Tensor,
     gamma: float = 1.0,
     detach_imp: bool = True,
+    self_normalized: bool = False,
+    normalizer: "SelfNormalizer | None" = None,
 ) -> tuple:
     """方差正则双重稳健损失（C2）。
 
     插补塔的训练目标改为 DR 估计量方差上界的加权平方误差，
     权重 (1-ẽ)/ẽ² 正是 MRDR 的推导结果。
 
-    :param detach_imp: dr 部分的 imp 是否 detach，默认 True（与 dr_loss 同理，
-        不 detach 会让 imp 通过线性项无界漂移）。DR-JL 交替训练口径也用它。
+    :param detach_imp: dr 部分的 imp 是否 detach。
+    :param self_normalized: 见 `dr_loss`；SNIPS 下可安全取 detach_imp=False。
     :return: (dr, gamma * imp_loss)
     """
     delta = F.binary_cross_entropy_with_logits(cvr_logit, conv.float(), reduction="none")
-    imp_for_dr = imp.detach() if detach_imp else imp
-
-    dr = (imp_for_dr + click * (delta - imp_for_dr) / e).mean()
+    if self_normalized:
+        w_snips = click / e
+        w_snips = (
+            normalizer.normalize(w_snips) if normalizer is not None
+            else w_snips / w_snips.mean().clamp_min(EPS)
+        )
+        imp_term = imp.detach() if detach_imp else imp
+        dr = (imp_term + w_snips * (delta - imp_term)).mean()
+    else:
+        imp_for_dr = imp.detach() if detach_imp else imp
+        dr = (imp_for_dr + click * (delta - imp_for_dr) / e).mean()
 
     w = click * (1.0 - e) / e.pow(2)
     imp_loss = (w * (delta.detach() - imp).pow(2)).sum() / click.sum().clamp_min(1.0)
