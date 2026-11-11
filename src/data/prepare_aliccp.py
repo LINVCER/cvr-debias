@@ -27,12 +27,18 @@ import pyarrow.parquet as pq
 # 稀疏域清单：实测自 90_reports/01_probe/field_inventory.json（train/test 完全一致）
 # 注意：109_14 / 110_14 / 127_14 / 150_14 是复合串，不能当整数处理
 SKELETON_FIELDS = ["205", "206", "207", "210", "216", "301", "508", "509", "702", "853"]
-# 22 个稀疏域：实测自 90_reports/01_probe/field_inventory.json（train/test 一致）
-# 101 已剔除：近唯一 ID 类特征，全量频次 < MIN_COUNT，OOV 率 100%（见 12-E6）
-COMMON_FIELDS = ["109_14", "110_14", "121", "122", "124", "125", "126",
+# 23 个稀疏域：实测自 90_reports/01_probe/field_inventory.json（train/test 一致）
+# 101 = 用户 ID（train 294,882 / test 295,787 人，并集 444,861，见 12-E33b）。
+# 它必须按曝光级计数，否则会被 MIN_COUNT=5 误剔：去重表上每值仅 1–4 次，
+# join 到曝光后平均 143 次（train 89.18% 的取值 ≥5）。
+COMMON_FIELDS = ["101", "109_14", "110_14", "121", "122", "124", "125", "126",
                  "127", "127_14", "128", "129", "150_14"]
-SPARSE_FIELDS = COMMON_FIELDS + SKELETON_FIELDS          # 22 个，顺序固定，不可插入
+SPARSE_FIELDS = COMMON_FIELDS + SKELETON_FIELDS          # 23 个，顺序固定，不可插入
 SKELETON_SET = set(SKELETON_FIELDS)
+
+# 真实用户 ID 所在的域：既作为稀疏特征之一，也单独哈希成 `uid` 列供 GAUC 分组。
+# `user_id` 列仍是公共特征组索引（历史命名），只负责 val 切分与 join 对账。
+USER_ID_FIELD = "101"
 
 # 特征串分隔符（实测）
 SEP_FEATURE = "\x01"    # 特征之间
@@ -40,10 +46,12 @@ SEP_FIELD = "\x02"      # field_id 与 value
 SEP_WEIGHT = "\x03"     # value 与 weight
 
 MIN_COUNT = 5           # 频次 < 5 归 OOV
-SHARD_ROWS = 500_000    # K=8 下单片约 0.7 GB（int64 读入前），2M 会压垮内存
+SHARD_ROWS = 250_000    # K=32 下单片约 0.74 GB 原始 int32，500k 会顶到 1.5 GB
 VAL_RATIO = 0.05
 
-ENCODE_MAX_LEN = 8      # 每域最多保留 K=8 个取值，不足补 0
+ENCODE_MAX_LEN = 32     # 每域最多保留 K 个取值，不足补 0
+# K=8 时 110_14（每行平均 250 个取值）只保留 3%，且取的是全局最热门的 8 个，
+# 页内个性化被池化抹平（15 号 A2）。K=32 后保留 13%，存储约 +2–4 GB。
 PAD_ID = 0              # 缺失/补齐
 OOV_ID = 1              # 词表外
 ENCODE_BATCH_ROWS = 5_000   # 纯 Python 编码的批大小，控制峰值内存
@@ -268,8 +276,26 @@ def _hash_user(uid: str) -> int:
     return int.from_bytes(digest[:8], "little") & ((1 << 63) - 1)
 
 
+_HASH_CACHE: dict[str, int] = {}
+
+
+def _hash_user_cached(uid: str) -> int:
+    """带缓存的版本：一件样本要哈希组索引与用户 ID 两列，42M 行不能重复算 md5。
+
+    组索引约 73 万、用户约 29 万，缓存后每个进程只算百万次以内。
+    """
+    value = _HASH_CACHE.get(uid)
+    if value is None:
+        value = _hash_user(uid)
+        _HASH_CACHE[uid] = value
+    return value
+
+
 def _load_vocab(path: Path) -> dict:
-    """加载并校验词表；id 约定 0=缺失、1=OOV、>=2 真实值，且 id 按频次降序分配。"""
+    """加载并校验词表；id 约定 0=缺失、1=OOV、>=2 真实值，且 id 按频次降序分配。
+
+    `max_len`（K）是编码参数、不是词表属性，故不在此校验——改 K 不需要重建词表。
+    """
     if not path.exists():
         raise SystemExit(f"[encode] 缺少词表 {path}，先运行 --stage vocab")
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -280,8 +306,9 @@ def _load_vocab(path: Path) -> dict:
     missing = [fid for fid in SPARSE_FIELDS if fid not in vocab]
     if missing:
         raise ValueError(f"词表缺少域：{missing}")
-    if int(data.get("max_len", ENCODE_MAX_LEN)) != ENCODE_MAX_LEN:
-        raise ValueError(f"词表 max_len 与代码 {ENCODE_MAX_LEN} 不一致")
+    fields = data.get("fields")
+    if fields is not None and list(fields) != list(SPARSE_FIELDS):
+        raise ValueError(f"词表 fields 与代码 SPARSE_FIELDS 顺序不一致：{fields}")
     return data
 
 
@@ -322,6 +349,7 @@ ENCODE_SCHEMA = pa.schema(
         ("conversion", pa.int8()),
         ("user_id", pa.int64()),
         ("row_no", pa.int64()),
+        ("uid", pa.int64()),          # 哈希后的真实用户 ID（域 101），只用于 GAUC
     ]
 )
 
@@ -331,12 +359,15 @@ def _encode_batch(
 ) -> tuple[pa.Table, dict]:
     """编码一个 batch；返回输出表和本批的标签/用户统计。"""
     columns: dict[str, pa.Array] = {}
+    user_values: list | None = None
     for pos, fid in enumerate(SPARSE_FIELDS):
         name = f"f_{fid}"
         idx = batch.schema.get_field_index(name)
         if idx < 0:
             raise ValueError(f"_join 产物缺少列 {name}，请确认 join 输出契约")
         raw_values = batch.column(idx).to_pylist()
+        if fid == USER_ID_FIELD:
+            user_values = raw_values
         flat: list[int] = []
         stat = field_stats[fid]
         field_map = vocab["vocab"][fid]
@@ -359,17 +390,27 @@ def _encode_batch(
     uids = batch.column(batch.schema.get_field_index("user_id")).to_pylist()
     row_nos = batch.column(batch.schema.get_field_index("row_no")).to_pylist()
 
-    hashed = [_hash_user(str(uid)) for uid in uids]
+    hashed = [_hash_user_cached(str(uid)) for uid in uids]
+    # 真实用户 ID：101 取首个值；缺失时退回组索引（口径退化但不会崩）
+    if user_values is None:
+        user_hashed = hashed
+    else:
+        user_hashed = [
+            _hash_user_cached(str(v[0])) if v else g
+            for v, g in zip(user_values, hashed)
+        ]
     columns["click"] = pa.array(clicks, type=pa.int8())
     columns["conversion"] = pa.array(conversions, type=pa.int8())
     columns["user_id"] = pa.array(hashed, type=pa.int64())
     columns["row_no"] = pa.array(row_nos, type=pa.int64())
+    columns["uid"] = pa.array(user_hashed, type=pa.int64())
 
     batch_stats = {
         "rows": len(clicks),
         "click": int(sum(1 for x in clicks if x == 1)),
         "conversion": int(sum(1 for x in conversions if x == 1)),
         "users": set(hashed),
+        "real_users": set(user_hashed),
     }
     return pa.table(columns, schema=ENCODE_SCHEMA), batch_stats
 
@@ -440,6 +481,7 @@ def _encode_split(
             "ctcvr": round(conversions / rows_out, 8) if rows_out else 0.0,
         },
         "fields": field_stats,
+        "max_len": ENCODE_MAX_LEN,      # 编码参数（K），不属于词表
         "output_files": len(out_files),
         "output_bytes": sum(p.stat().st_size for p in out_files),
         "elapsed_sec": round(time.time() - t0, 1),
@@ -456,7 +498,7 @@ def encode(
 ) -> dict:
     """L2：把 `_join` 字符串宽表编码成定长 int32，每域 K=8。
 
-    输入列：user_id, click, conversion, row_no, f_<field>（list<string>，22 个域）。
+    输入列：user_id, click, conversion, row_no, f_<field>（list<string>，23 个域）。
     输出列：同标签 + user_id(int64 哈希) + f_<field>（fixed_size_list<int32>[8]）。
     0=缺失/补齐、1=OOV、>=2 真实值；词表 id 按频次降序，截断即取最小 K 个。
     本阶段不删行，rows_in 必须等于 rows_out；变动记录写入 encode_report。
@@ -603,7 +645,9 @@ def _clean_split(
                     kv = kept.column("conversion").to_pylist()
                     out_clicks["test"] += sum(kc)
                     out_convs["test"] += sum(kv)
-                    out_users["test"].update(kept.column("user_id").to_pylist())
+                    out_users["test"].update(
+                        kept.column("uid" if "uid" in kept.column_names else "user_id").to_pylist()
+                    )
                 else:
                     uarr = kept.column("user_id").to_pylist()
                     is_val = [u < train_cutoff for u in uarr]
@@ -618,7 +662,9 @@ def _clean_split(
                         sv = sub.column("conversion").to_pylist()
                         out_clicks[name] += sum(sc)
                         out_convs[name] += sum(sv)
-                        out_users[name].update(sub.column("user_id").to_pylist())
+                        out_users[name].update(
+                            sub.column("uid" if "uid" in sub.column_names else "user_id").to_pylist()
+                        )
         finally:
             for w in writers.values():
                 w.close()
@@ -895,6 +941,7 @@ def stream_join(split: str = "train", limit: int = 0) -> dict:
             "ctcvr": round(conversions / rows_out, 8) if rows_out else 0.0,
         },
         "fields": field_stats,
+        "max_len": ENCODE_MAX_LEN,      # 编码参数（K），不属于词表
         "output": str(out_path),
         "output_bytes": out_path.stat().st_size,
         "elapsed_sec": round(elapsed, 1),
@@ -1241,6 +1288,7 @@ def join_encode_full(
         "unique_users": total_users,
         "labels": _clean_labels(total_out, all_clicks, all_convs),
         "fields": field_stats,
+        "max_len": ENCODE_MAX_LEN,      # 编码参数（K），不属于词表
         "output_files": len(out_files),
         "output_bytes": sum(p.stat().st_size for p in out_files),
         "elapsed_sec": round(time.time() - t0, 1),
@@ -1253,37 +1301,61 @@ def join_encode_full(
     return report
 
 
-def _count_common_vocab() -> tuple[dict[str, dict[str, int]], dict]:
-    """扫 L1 train 统计 13 个公共域的取值频次（值按出现次数计，不去重）。
+def _count_common_vocab(
+    group_exposure: dict[str, int] | None = None, src: Path | None = None
+) -> tuple[dict[str, dict[str, int]], dict]:
+    """扫 L1 train 统计 13 个公共域的取值频次（按曝光加权）。
 
-    L1 每行是 (user_id, field[], value[]) 平行数组，按位置对齐后逐值计数。
+    L1 每组一行，而一组公共特征会被该页**所有曝光**复用（train 平均 57.9 条/组）。
+    `MIN_COUNT` 的语义是「在训练样本中出现次数」，因此必须乘上组内的曝光数；
+    否则 101（用户 ID，每组只出现 1 次）会被判成低频 → 全量 OOV（12-E33b）。
+
+    :param group_exposure: common_feature_index → 该组曝光数；None 表示按组计（不推荐）
+    :param src: L1 目录，默认 `10_interim/common_index/train`，测试可传临时目录
     """
-    src = INTERIM / "common_index" / "train"
+    src = src or INTERIM / "common_index" / "train"
     if not src.exists():
         raise SystemExit(f"[vocab] 缺少 L1 {src}，先运行 --stage index")
 
     counts: dict[str, dict[str, int]] = {fid: {} for fid in COMMON_FIELDS}
-    rows_in = 0
+    rows_in = skipped = 0
     t0 = time.time()
     for part in sorted(src.glob("part-*.parquet")):
         for batch in pq.ParquetFile(part).iter_batches(
-            batch_size=10_000, columns=["field", "value"]
+            batch_size=10_000, columns=["user_id", "field", "value"]
         ):
             d = batch.to_pydict()
-            rows_in += len(d["field"])
-            for fields, values in zip(d["field"], d["value"]):
+            rows_in += len(d["user_id"])
+            for gid, fields, values in zip(d["user_id"], d["field"], d["value"]):
+                w = 1 if group_exposure is None else group_exposure.get(gid, 0)
+                if w <= 0:  # 该组在骨架里没有曝光，对训练样本没有贡献
+                    skipped += 1
+                    continue
                 for fid, value in zip(fields, values):
                     counter = counts.get(fid)
-                    if counter is not None:  # 只统计 13 个公共域，意外域忽略
-                        counter[value] = counter.get(value, 0) + 1
-    meta = {"source": str(src), "rows_in": rows_in, "elapsed_sec": round(time.time() - t0, 1)}
+                    if counter is not None:  # 只统计公共域，意外域忽略
+                        counter[value] = counter.get(value, 0) + w
+    meta = {
+        "source": str(src),
+        "rows_in": rows_in,
+        "rows_skipped_no_exposure": skipped,
+        "weighted_by_exposure": group_exposure is not None,
+        "elapsed_sec": round(time.time() - t0, 1),
+    }
     return counts, meta
 
 
-def _count_skeleton_vocab(limit: int = 0) -> tuple[dict[str, dict[str, int]], dict]:
-    """流式扫骨架 train 统计 10 个骨架域的取值频次。"""
+def _count_skeleton_vocab(
+    limit: int = 0,
+) -> tuple[dict[str, dict[str, int]], dict, dict[str, int]]:
+    """流式扫骨架 train 统计 10 个骨架域的取值频次，同时返回每组曝光数。
+
+    曝光数用于给公共域词表加权：骨架一行 = 一条曝光，按 common_feature_index 聚合
+    即得每组的曝光条数（12-E33b）。
+    """
     src = RAW / "train" / "sample_skeleton_train.csv"
     counts: dict[str, dict[str, int]] = {fid: {} for fid in SKELETON_FIELDS}
+    group_exposure: dict[str, int] = {}
     rows_in = malformed = 0
     t0 = time.time()
     with src.open("rb") as f:
@@ -1295,7 +1367,8 @@ def _count_skeleton_vocab(limit: int = 0) -> tuple[dict[str, dict[str, int]], di
             if parsed is None:
                 malformed += 1
                 continue
-            _, _, _, _, _, skel = parsed
+            _, _, _, uid, _, skel = parsed
+            group_exposure[uid] = group_exposure.get(uid, 0) + 1
             for fid, values in skel.items():
                 counter = counts[fid]
                 for value in values:
@@ -1304,26 +1377,29 @@ def _count_skeleton_vocab(limit: int = 0) -> tuple[dict[str, dict[str, int]], di
         "source": str(src),
         "rows_in": rows_in,
         "malformed_rows": malformed,
+        "groups": len(group_exposure),
         "limit": limit,
         "elapsed_sec": round(time.time() - t0, 1),
     }
-    return counts, meta
+    return counts, meta, group_exposure
 
 
 def build_vocab(limit: int = 0) -> dict:
-    """L2：只用 train 统计 22 个域的取值频次，写 20_processed/vocab.json。
+    """L2：只用 train 统计 23 个域的取值频次，写 20_processed/vocab.json。
 
+    顺序：先扫骨架（拿到每组曝光数），再扫 L1（公共域按曝光加权计数）。
     词表 id 约定：0=缺失、1=OOV、>=2 真实取值，id 按频次降序分配（id 越小频次越高，
     encode 截断时取最小 K 个即高频前 K）。频次 < MIN_COUNT 归 OOV、不进词表。
     test 不参与统计，其新值在 encode 时统一映射到 1。
 
     输出格式（与 _load_vocab 的校验契约一致）：
-        {"max_len": 8, "min_count": 5, "field_dims": [22 个 int],
-         "vocab": {"field_id": {"原值": id}}}
+        {"min_count": 5, "fields": [23 个 field_id],
+         "field_dims": [23 个 int], "vocab": {"field_id": {"原值": id}}}
+    `max_len`（K）属编码参数，写进 encode 报告，不写进词表。
     """
     ts = datetime.now()
-    common_counts, common_meta = _count_common_vocab()
-    skel_counts, skel_meta = _count_skeleton_vocab(limit=limit)
+    skel_counts, skel_meta, group_exposure = _count_skeleton_vocab(limit=limit)
+    common_counts, common_meta = _count_common_vocab(group_exposure)
 
     raw_counts = {**common_counts, **skel_counts}
     if set(raw_counts) != set(SPARSE_FIELDS):
@@ -1362,7 +1438,7 @@ def build_vocab(limit: int = 0) -> dict:
         "generated_at": ts.isoformat(timespec="seconds"),
         "split": "train",
         "min_count": MIN_COUNT,
-        "max_len": ENCODE_MAX_LEN,
+        "fields": SPARSE_FIELDS,
         "field_dims": dims,
         "vocab": vocab,
     }
@@ -1373,7 +1449,6 @@ def build_vocab(limit: int = 0) -> dict:
         "stage": "vocab",
         "split": "train",
         "min_count": MIN_COUNT,
-        "max_len": ENCODE_MAX_LEN,
         "limit": limit,
         "sources": {"common": common_meta, "skeleton": skel_meta},
         "fields": field_report,
@@ -1385,7 +1460,7 @@ def build_vocab(limit: int = 0) -> dict:
     report_path = report_dir / f"vocab_report_{ts:%Y%m%d-%H%M%S}.json"
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(
-        f"[vocab] 22 域共 {sum(dims):,} 个 id，词表 {report['output_bytes'] / 2**20:.1f} MiB，"
+        f"[vocab] 23 域共 {sum(dims):,} 个 id，词表 {report['output_bytes'] / 2**20:.1f} MiB，"
         f"报告 {report_path}"
     )
     return report

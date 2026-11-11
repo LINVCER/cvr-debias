@@ -38,8 +38,8 @@ def _write_vocab(path: Path) -> None:
             vocab[fid] = {"a": 2, "b": 3}
             dims.append(4)
         elif fid == "121":
-            vocab[fid] = {f"v{i}": i + 2 for i in range(12)}
-            dims.append(14)
+            vocab[fid] = {f"v{i}": i + 2 for i in range(40)}
+            dims.append(42)
         else:
             vocab[fid] = {}
             dims.append(2)
@@ -61,7 +61,7 @@ def test_encode_contract(tmp_path: Path) -> None:
             {"user_id": "u1", "click": 1, "conversion": 1, "row_no": 10,
              "109_14": ["a", "b", "c"], "121": ["v0", "v1"]},
             {"user_id": "u2", "click": 0, "conversion": 0, "row_no": 11,
-             "109_14": ["b"] * 10, "121": [f"v{i}" for i in range(12)]},
+             "109_14": ["b"] * 10, "121": [f"v{i}" for i in range(40)]},
             {"user_id": "u1", "click": 0, "conversion": 0, "row_no": 12},
         ],
     )
@@ -86,7 +86,7 @@ def test_encode_contract(tmp_path: Path) -> None:
     assert f109[2] == [PAD_ID] * ENCODE_MAX_LEN
 
     f121 = table.column("f_121").to_pylist()
-    assert f121[1] == list(range(2, 10))                       # K=8 截断
+    assert f121[1] == list(range(2, 2 + ENCODE_MAX_LEN))       # 超过 K 时截断
     assert f121[2] == [PAD_ID] * ENCODE_MAX_LEN
 
     users = table.column("user_id").to_pylist()

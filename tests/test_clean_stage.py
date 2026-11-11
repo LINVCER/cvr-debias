@@ -22,6 +22,7 @@ def _write_encoded(path: Path, rows: list[dict]) -> None:
         "conversion": pa.array([r["conversion"] for r in rows], type=pa.int8()),
         "user_id": pa.array([r["user_id"] for r in rows], type=pa.int64()),
         "row_no": pa.array([r["row_no"] for r in rows], type=pa.int64()),
+        "uid": pa.array([r.get("uid", r["user_id"]) for r in rows], type=pa.int64()),
     }
     for fid in SPARSE_FIELDS:
         columns[f"f_{fid}"] = pa.array(

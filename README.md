@@ -126,7 +126,7 @@ python scripts/download_data.py --out data/aliccp/_incoming --url "<链接>" \
 
 | 代码 | 总案章节 | 说明 |
 | --- | --- | --- |
-| `src/features/embedding.py` | §2.2、§6.3 | 22 个稀疏域各一张 embedding 表、统一维度（101 全量 OOV 已剔除） |
+| `src/features/embedding.py` | §2.2、§6.3 | 23 个稀疏域各一张 embedding 表、统一维度（含用户 ID 域 101） |
 | `src/models/experts.py` | §2.2（C3） | 因果解耦专家层，本科进展望章，代码保留 |
 | `src/models/uc_escm.py` | §2.2、§2.3 | 4 层 3 塔，输出同时供损失层使用 |
 | `src/losses/causal.py` | §2.3（C1/C2） | IPS / DR / 方差正则 DR，`ẽ` 必须 detach |

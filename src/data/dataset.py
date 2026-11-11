@@ -3,7 +3,8 @@
 约定（来自预处理流水线，K=8 定长契约）：
 - 每片 ≤50 万行，按 data/aliccp/20_processed/{train,val,test}/part-*.parquet 组织；
 - 特征列为 f_<field>，类型 list<int32>[K]，0=缺失/补齐、1=OOV、>=2 真实取值；
-- 标签单独存 click / conversion 两列；user_id 已哈希成 int64，只用于 GAUC 分组。
+- 标签单独存 click / conversion 两列；user_id 是公共特征组索引（哈希），
+  uid 是真实用户 ID（域 101，哈希），GAUC 按 uid 分组。
 
 内存约束：K=8 下 train 全量拼接约 62 GB，不可整体 cat。本模块只做两件事——
 按文件惰性产批（iter_batches），以及把分片读成 [B, F, K] 张量（load_split，
@@ -38,8 +39,10 @@ def _table_to_tensors(table, label_cols) -> dict:
         [table.column(c).to_numpy(zero_copy_only=False) for c in label_cols], axis=1
     )
     user = (
-        torch.as_tensor(table.column("user_id").to_numpy(), dtype=torch.long)
-        if "user_id" in names
+        # uid = 哈希后的真实用户 ID（域 101）；旧分片没有该列时退回组索引
+        torch.as_tensor(table.column("uid" if "uid" in names else "user_id").to_numpy(),
+                        dtype=torch.long)
+        if ("uid" in names or "user_id" in names)
         else torch.zeros(len(table), dtype=torch.long)
     )
     return {
